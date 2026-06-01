@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Autoware CUDA / TensorRT dependency graph</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: rgba(30, 41, 59, 0.85);
+    --border: rgba(148, 163, 184, 0.25);
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --foundation: #94a3b8;
+    --util: #60a5fa;
+    --trtblock: #4ade80;
+    --model: #fb923c;
+    --composite: #facc15;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: radial-gradient(1200px 800px at 70% -10%, #1e293b 0%, var(--bg) 60%);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #graph { position: fixed; inset: 0; }
+  header {
+    position: fixed; top: 0; left: 0; right: 0; padding: 16px 22px;
+    pointer-events: none; z-index: 5;
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: 0.2px; }
+  header p { margin: 4px 0 0; font-size: 12.5px; color: var(--muted); }
+  .card {
+    position: fixed; z-index: 6;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; backdrop-filter: blur(8px);
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  #legend { left: 22px; bottom: 22px; padding: 12px 14px; min-width: 220px; }
+  #legend h2 { margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600; }
+  .legend-item { display: flex; align-items: center; gap: 9px; padding: 4px 6px; border-radius: 7px; cursor: pointer; user-select: none; font-size: 13px; transition: background 0.15s; }
+  .legend-item:hover { background: rgba(148,163,184,0.12); }
+  .legend-item.off { opacity: 0.4; }
+  .legend-item .dot { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+  .legend-item .count { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  #hint { right: 22px; bottom: 22px; padding: 11px 14px; font-size: 12px; color: var(--muted); max-width: 260px; line-height: 1.6; }
+  #hint b { color: var(--text); font-weight: 600; }
+  #tooltip {
+    position: fixed; z-index: 10; pointer-events: none; opacity: 0;
+    transform: translate(-50%, calc(-100% - 14px));
+    background: #0b1220; border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; max-width: 280px; box-shadow: 0 12px 28px rgba(0,0,0,0.5);
+    transition: opacity 0.12s;
+  }
+  #tooltip .name { font-size: 13.5px; font-weight: 650; }
+  #tooltip .tier { font-size: 11px; text-transform: uppercase; letter-spacing: 0.6px; margin-top: 2px; }
+  #tooltip .desc { font-size: 12.5px; color: var(--text); margin-top: 7px; line-height: 1.45; }
+  #tooltip .gpu { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+  #tooltip .deg { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+  .node circle { cursor: pointer; stroke: #0f172a; stroke-width: 1.5px; transition: opacity 0.15s; }
+  .node text { font-size: 10.5px; fill: var(--text); paint-order: stroke; stroke: #0f172a; stroke-width: 3px; stroke-linejoin: round; pointer-events: none; transition: opacity 0.15s; }
+  .link { fill: none; transition: stroke 0.15s, opacity 0.15s; }
+  .faded { opacity: 0.07 !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Autoware &middot; CUDA / TensorRT dependency graph</h1>
+  <p>30 GPU packages &middot; 74 build/link dependencies &middot; arrows point from a package to what it depends on
+  &middot; <a href="https://github.com/xmfcx/autoware-cuda-graph#readme" style="color:#60a5fa; pointer-events:auto; text-decoration:none;">&#128214; package list &amp; README</a></p>
+</header>
+
+<svg id="graph"></svg>
+
+<div id="legend" class="card">
+  <h2>Tiers &mdash; click to filter</h2>
+</div>
+
+<div id="hint" class="card">
+  <b>Drag</b> to reposition &middot; <b>scroll</b> to zoom &middot; <b>hover</b> a node to trace its dependencies &middot; <b>click</b> to pin/unpin
+</div>
+
+<div id="tooltip">
+  <div class="name"></div>
+  <div class="tier"></div>
+  <div class="desc"></div>
+  <div class="gpu"></div>
+  <div class="deg"></div>
+</div>
+
+<script>
+const TIERS = {
+  foundation: { label: "Foundation", color: "#94a3b8" },
+  util:       { label: "Core wrappers", color: "#60a5fa" },
+  trtblock:   { label: "TensorRT building blocks", color: "#4ade80" },
+  model:      { label: "Model / inference nodes", color: "#fb923c" },
+  composite:  { label: "Composite consumers", color: "#facc15" },
+};
+
+const NODES = [
+  { id: "autoware_cuda_dependency_meta", tier: "foundation", gpu: "meta/stub", desc: "Virtual CUDA on/off switch (empty stub) so dependents can build with or without CUDA." },
+  { id: "cuda_blackboard", tier: "foundation", gpu: "CUDA buffers", desc: "Zero-copy CUDA buffer transport for passing GPU memory between nodes." },
+  { id: "bevdet_vendor", tier: "foundation", gpu: "TensorRT + kernels (8 .cu)", desc: "Vendored BEVDet TensorRT implementation with custom CUDA kernels and plugins." },
+
+  { id: "autoware_cuda_utils", tier: "util", gpu: "CUDA kernels (5 .cu)", desc: "Shared CUDA memory / stream / error-checking helpers + thrust utilities." },
+  { id: "autoware_tensorrt_common", tier: "util", gpu: "TensorRT", desc: "Common TensorRT engine/runtime abstraction and profiler." },
+
+  { id: "autoware_tensorrt_plugins", tier: "trtblock", gpu: "TensorRT + kernels (7 .cu)", desc: "Custom TensorRT CUDA plugins (bev_pool, scatter, argsort, rotate, ...)." },
+  { id: "autoware_tensorrt_classifier", tier: "trtblock", gpu: "TensorRT + kernels (1 .cu)", desc: "Generic TensorRT image-classifier wrapper with a CUDA preprocessing kernel." },
+  { id: "autoware_tensorrt_yolox", tier: "trtblock", gpu: "TensorRT + kernels (1 .cu)", desc: "YOLOX object detector on TensorRT with a CUDA preprocessing kernel." },
+  { id: "trt_batched_nms", tier: "trtblock", gpu: "TensorRT + kernels (6 .cu)", desc: "TensorRT batched non-maximum-suppression plugin." },
+
+  { id: "autoware_lidar_centerpoint", tier: "model", gpu: "TensorRT + kernels (4 .cu)", desc: "CenterPoint LiDAR 3D object detection." },
+  { id: "autoware_lidar_transfusion", tier: "model", gpu: "TensorRT + kernels (3 .cu)", desc: "TransFusion LiDAR 3D object detection." },
+  { id: "autoware_lidar_frnet", tier: "model", gpu: "TensorRT + kernels (2 .cu)", desc: "FRNet LiDAR point-cloud semantic segmentation." },
+  { id: "autoware_ptv3", tier: "model", gpu: "TensorRT + kernels (2 .cu)", desc: "Point Transformer v3 LiDAR 3D detection." },
+  { id: "autoware_bevfusion", tier: "model", gpu: "TensorRT + kernels (4 .cu)", desc: "BEVFusion camera + LiDAR multi-view 3D object detection." },
+  { id: "autoware_camera_streampetr", tier: "model", gpu: "TensorRT + kernels (4 .cu)", desc: "StreamPETR streaming camera 3D object detection." },
+  { id: "autoware_lidar_apollo_instance_segmentation", tier: "model", gpu: "TensorRT", desc: "Apollo CNN LiDAR instance segmentation." },
+  { id: "autoware_bytetrack", tier: "model", gpu: "TensorRT (via wrappers)", desc: "ByteTrack multi-object tracking." },
+  { id: "autoware_shape_estimation", tier: "model", gpu: "TensorRT", desc: "Bounding-box shape estimation with an optional TensorRT ML corrector." },
+  { id: "autoware_simpl_prediction", tier: "model", gpu: "TensorRT", desc: "SIMPL multi-agent trajectory prediction." },
+  { id: "autoware_tensorrt_vad", tier: "model", gpu: "TensorRT + kernels (3 .cu)", desc: "VAD (Vectorized Autonomous Driving) end-to-end driving node." },
+  { id: "autoware_diffusion_planner", tier: "model", gpu: "TensorRT", desc: "Diffusion-model-based motion planner on TensorRT." },
+  { id: "autoware_tensorrt_bevformer", tier: "model", gpu: "TensorRT + kernels (5 .cu)", desc: "BEVFormer multi-camera 3D detection (deformable-attention plugins)." },
+  { id: "autoware_tensorrt_bevdet", tier: "model", gpu: "TensorRT (via bevdet_vendor)", desc: "Autoware wrapper node around the bevdet_vendor BEVDet implementation." },
+  { id: "autoware_calibration_status_classifier", tier: "model", gpu: "TensorRT + kernels (1 .cu)", desc: "Detects LiDAR-camera miscalibration with a small TensorRT classifier." },
+  { id: "autoware_probabilistic_occupancy_grid_map", tier: "model", gpu: "CUDA kernels (5 .cu)", desc: "GPU probabilistic occupancy-grid-map generation." },
+  { id: "autoware_cuda_pointcloud_preprocessor", tier: "model", gpu: "CUDA kernels (8 .cu)", desc: "GPU point-cloud preprocessing: concat, downsample, outlier removal, crop." },
+  { id: "autoware_ground_segmentation_cuda", tier: "model", gpu: "CUDA kernels (1 .cu)", desc: "GPU-accelerated ground segmentation filter." },
+
+  { id: "autoware_traffic_light_classifier", tier: "composite", gpu: "TensorRT", desc: "Traffic-light color/state classification (via TensorRT classifier wrappers)." },
+  { id: "autoware_traffic_light_fine_detector", tier: "composite", gpu: "TensorRT", desc: "Fine-grained traffic-light detection via YOLOX." },
+  { id: "autoware_image_projection_based_fusion", tier: "composite", gpu: "TensorRT + kernels (1 .cu)", desc: "RoI / point-painting camera-LiDAR fusion (reuses CenterPoint)." },
+];
+
+const LINKS = [
+  { source: "autoware_bevfusion", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_bevfusion", target: "autoware_cuda_utils" },
+  { source: "autoware_bevfusion", target: "autoware_tensorrt_common" },
+  { source: "autoware_bevfusion", target: "autoware_tensorrt_plugins" },
+  { source: "autoware_bevfusion", target: "cuda_blackboard" },
+  { source: "autoware_bytetrack", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_bytetrack", target: "autoware_cuda_utils" },
+  { source: "autoware_bytetrack", target: "autoware_tensorrt_common" },
+  { source: "autoware_calibration_status_classifier", target: "autoware_cuda_utils" },
+  { source: "autoware_calibration_status_classifier", target: "autoware_tensorrt_common" },
+  { source: "autoware_camera_streampetr", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_camera_streampetr", target: "autoware_cuda_utils" },
+  { source: "autoware_camera_streampetr", target: "autoware_tensorrt_common" },
+  { source: "autoware_cuda_pointcloud_preprocessor", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_cuda_pointcloud_preprocessor", target: "autoware_cuda_utils" },
+  { source: "autoware_cuda_pointcloud_preprocessor", target: "cuda_blackboard" },
+  { source: "autoware_cuda_utils", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_diffusion_planner", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_diffusion_planner", target: "autoware_cuda_utils" },
+  { source: "autoware_diffusion_planner", target: "autoware_tensorrt_common" },
+  { source: "autoware_diffusion_planner", target: "autoware_tensorrt_plugins" },
+  { source: "autoware_ground_segmentation_cuda", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_ground_segmentation_cuda", target: "autoware_cuda_pointcloud_preprocessor" },
+  { source: "autoware_ground_segmentation_cuda", target: "autoware_cuda_utils" },
+  { source: "autoware_ground_segmentation_cuda", target: "cuda_blackboard" },
+  { source: "autoware_image_projection_based_fusion", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_image_projection_based_fusion", target: "autoware_lidar_centerpoint" },
+  { source: "autoware_lidar_apollo_instance_segmentation", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_lidar_apollo_instance_segmentation", target: "autoware_cuda_utils" },
+  { source: "autoware_lidar_apollo_instance_segmentation", target: "autoware_tensorrt_common" },
+  { source: "autoware_lidar_centerpoint", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_lidar_centerpoint", target: "autoware_cuda_utils" },
+  { source: "autoware_lidar_centerpoint", target: "autoware_tensorrt_common" },
+  { source: "autoware_lidar_centerpoint", target: "cuda_blackboard" },
+  { source: "autoware_lidar_frnet", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_lidar_frnet", target: "autoware_cuda_utils" },
+  { source: "autoware_lidar_frnet", target: "autoware_tensorrt_common" },
+  { source: "autoware_lidar_frnet", target: "cuda_blackboard" },
+  { source: "autoware_lidar_transfusion", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_lidar_transfusion", target: "autoware_tensorrt_common" },
+  { source: "autoware_lidar_transfusion", target: "cuda_blackboard" },
+  { source: "autoware_probabilistic_occupancy_grid_map", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_probabilistic_occupancy_grid_map", target: "autoware_cuda_utils" },
+  { source: "autoware_ptv3", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_ptv3", target: "autoware_cuda_utils" },
+  { source: "autoware_ptv3", target: "autoware_tensorrt_common" },
+  { source: "autoware_ptv3", target: "autoware_tensorrt_plugins" },
+  { source: "autoware_ptv3", target: "cuda_blackboard" },
+  { source: "autoware_shape_estimation", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_shape_estimation", target: "autoware_cuda_utils" },
+  { source: "autoware_shape_estimation", target: "autoware_tensorrt_common" },
+  { source: "autoware_simpl_prediction", target: "autoware_cuda_utils" },
+  { source: "autoware_simpl_prediction", target: "autoware_tensorrt_common" },
+  { source: "autoware_tensorrt_bevdet", target: "bevdet_vendor" },
+  { source: "autoware_tensorrt_bevformer", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_tensorrt_classifier", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_tensorrt_classifier", target: "autoware_cuda_utils" },
+  { source: "autoware_tensorrt_classifier", target: "autoware_tensorrt_common" },
+  { source: "autoware_tensorrt_common", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_tensorrt_plugins", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_tensorrt_plugins", target: "autoware_cuda_utils" },
+  { source: "autoware_tensorrt_vad", target: "autoware_tensorrt_common" },
+  { source: "autoware_tensorrt_vad", target: "autoware_tensorrt_plugins" },
+  { source: "autoware_tensorrt_yolox", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_tensorrt_yolox", target: "autoware_cuda_utils" },
+  { source: "autoware_tensorrt_yolox", target: "autoware_tensorrt_common" },
+  { source: "autoware_traffic_light_classifier", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_traffic_light_classifier", target: "autoware_cuda_utils" },
+  { source: "autoware_traffic_light_classifier", target: "autoware_tensorrt_classifier" },
+  { source: "autoware_traffic_light_classifier", target: "autoware_tensorrt_common" },
+  { source: "autoware_traffic_light_fine_detector", target: "autoware_cuda_dependency_meta" },
+  { source: "autoware_traffic_light_fine_detector", target: "autoware_tensorrt_yolox" },
+  { source: "trt_batched_nms", target: "autoware_cuda_utils" },
+  { source: "trt_batched_nms", target: "autoware_tensorrt_common" },
+];
+
+// ---- derive metrics ----
+const byId = new Map(NODES.map(n => [n.id, n]));
+NODES.forEach(n => { n.inDeg = 0; n.outDeg = 0; });
+const neighbors = new Map(NODES.map(n => [n.id, new Set()]));
+LINKS.forEach(l => {
+  byId.get(l.target).inDeg++;
+  byId.get(l.source).outDeg++;
+  neighbors.get(l.source).add(l.target);
+  neighbors.get(l.target).add(l.source);
+});
+const label = id => id.replace(/^autoware_/, "");
+const rScale = d3.scaleSqrt().domain([0, d3.max(NODES, n => n.inDeg)]).range([8, 30]);
+const radius = n => rScale(n.inDeg);
+
+// ---- svg setup ----
+const svg = d3.select("#graph");
+const width = () => window.innerWidth, height = () => window.innerHeight;
+const root = svg.append("g");
+
+// arrow markers
+svg.append("defs").append("marker")
+  .attr("id", "arrow").attr("viewBox", "0 -5 10 10")
+  .attr("refX", 10).attr("refY", 0)
+  .attr("markerWidth", 6).attr("markerHeight", 6).attr("orient", "auto")
+  .append("path").attr("d", "M0,-5L10,0L0,5").attr("fill", "rgba(148,163,184,0.55)");
+
+const zoom = d3.zoom().scaleExtent([0.25, 4]).on("zoom", e => root.attr("transform", e.transform));
+svg.call(zoom);
+
+// ---- simulation ----
+const sim = d3.forceSimulation(NODES)
+  .force("link", d3.forceLink(LINKS).id(d => d.id).distance(95).strength(0.5))
+  .force("charge", d3.forceManyBody().strength(-560))
+  .force("collide", d3.forceCollide().radius(n => radius(n) + 18))
+  .force("x", d3.forceX().strength(0.06))
+  .force("y", d3.forceY().strength(0.06))
+  .force("center", d3.forceCenter());
+
+const link = root.append("g")
+  .attr("stroke", "rgba(148,163,184,0.28)").attr("stroke-width", 1.3)
+  .selectAll("path").data(LINKS).join("path")
+  .attr("class", "link").attr("marker-end", "url(#arrow)");
+
+const node = root.append("g")
+  .selectAll("g").data(NODES).join("g").attr("class", "node")
+  .call(d3.drag()
+    .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+    .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
+    .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); if (!d.pinned) { d.fx = null; d.fy = null; } }));
+
+node.append("circle")
+  .attr("r", radius)
+  .attr("fill", d => TIERS[d.tier].color);
+
+node.append("text")
+  .attr("x", d => radius(d) + 5).attr("y", 4)
+  .text(d => label(d.id));
+
+// ---- interactions ----
+const tooltip = d3.select("#tooltip");
+node.on("mouseover", (e, d) => {
+    const keep = neighbors.get(d.id); keep.add(d.id);
+    node.classed("faded", n => !keep.has(n.id));
+    link.classed("faded", l => l.source.id !== d.id && l.target.id !== d.id)
+        .attr("stroke", l => (l.source.id === d.id || l.target.id === d.id) ? "#e2e8f0" : null);
+    tooltip.select(".name").text(d.id);
+    tooltip.select(".tier").text(TIERS[d.tier].label).style("color", TIERS[d.tier].color);
+    tooltip.select(".desc").text(d.desc);
+    tooltip.select(".gpu").text("GPU: " + d.gpu);
+    tooltip.select(".deg").text(`${d.inDeg} package(s) depend on this · depends on ${d.outDeg}`);
+    tooltip.style("opacity", 1);
+  })
+  .on("mousemove", e => tooltip.style("left", e.clientX + "px").style("top", e.clientY + "px"))
+  .on("mouseout", () => {
+    node.classed("faded", false);
+    link.classed("faded", false).attr("stroke", null);
+    tooltip.style("opacity", 0);
+  })
+  .on("click", (e, d) => {
+    d.pinned = !d.pinned;
+    if (d.pinned) { d.fx = d.x; d.fy = d.y; } else { d.fx = null; d.fy = null; }
+    d3.select(e.currentTarget).select("circle")
+      .attr("stroke", d.pinned ? "#fff" : "#0f172a")
+      .attr("stroke-width", d.pinned ? 2.5 : 1.5);
+  });
+
+sim.on("tick", () => {
+  link.attr("d", d => {
+    const dx = d.target.x - d.source.x, dy = d.target.y - d.source.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const tx = d.target.x - dx / len * (radius(d.target) + 7);
+    const ty = d.target.y - dy / len * (radius(d.target) + 7);
+    return `M${d.source.x},${d.source.y}L${tx},${ty}`;
+  });
+  node.attr("transform", d => `translate(${d.x},${d.y})`);
+});
+
+// ---- legend + tier filtering ----
+const active = new Set(Object.keys(TIERS));
+const legend = d3.select("#legend");
+Object.entries(TIERS).forEach(([key, t]) => {
+  const count = NODES.filter(n => n.tier === key).length;
+  const item = legend.append("div").attr("class", "legend-item").attr("data-tier", key);
+  item.append("span").attr("class", "dot").style("background", t.color);
+  item.append("span").text(t.label);
+  item.append("span").attr("class", "count").text(count);
+  item.on("click", function () {
+    if (active.has(key)) active.delete(key); else active.add(key);
+    d3.select(this).classed("off", !active.has(key));
+    applyFilter();
+  });
+});
+function applyFilter() {
+  node.style("display", d => active.has(d.tier) ? null : "none");
+  link.style("display", l => active.has(l.source.tier) && active.has(l.target.tier) ? null : "none");
+}
+
+// ---- center on resize ----
+function recenter() {
+  svg.attr("width", width()).attr("height", height());
+  sim.force("center").x(width() / 2).y(height() / 2);
+  sim.alpha(0.4).restart();
+}
+window.addEventListener("resize", recenter);
+recenter();
+// gentle initial transform so it isn't glued to a corner
+svg.call(zoom.transform, d3.zoomIdentity);
+</script>
+</body>
+</html>
