@@ -64,6 +64,11 @@
   .node text { font-size: 10.5px; fill: var(--text); paint-order: stroke; stroke: #0f172a; stroke-width: 3px; stroke-linejoin: round; pointer-events: none; transition: opacity 0.15s; }
   .link { fill: none; transition: stroke 0.15s, opacity 0.15s; }
   .faded { opacity: 0.07 !important; }
+  #controls { top: 74px; right: 22px; padding: 11px 14px; }
+  #controls .row { display: flex; align-items: center; gap: 10px; }
+  #controls label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-weight: 600; }
+  #controls input[type=range] { width: 150px; accent-color: #60a5fa; cursor: pointer; }
+  #controls .val { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text); min-width: 30px; text-align: right; }
 </style>
 </head>
 <body>
@@ -81,6 +86,14 @@
 
 <div id="hint" class="card">
   <b>Drag</b> to reposition &middot; <b>scroll</b> to zoom &middot; <b>hover</b> a node to trace its dependencies &middot; <b>click</b> to pin/unpin
+</div>
+
+<div id="controls" class="card">
+  <div class="row">
+    <label for="spread">Spacing</label>
+    <input type="range" id="spread" min="0.6" max="3" step="0.05" value="2.0" />
+    <span class="val" id="spread-val">2.0&times;</span>
+  </div>
 </div>
 
 <div id="tooltip">
@@ -244,12 +257,13 @@ const zoom = d3.zoom().scaleExtent([0.25, 4]).on("zoom", e => root.attr("transfo
 svg.call(zoom);
 
 // ---- simulation ----
+const BASE_LINK = 90, BASE_CHARGE = -560;
 const sim = d3.forceSimulation(NODES)
-  .force("link", d3.forceLink(LINKS).id(d => d.id).distance(95).strength(0.5))
-  .force("charge", d3.forceManyBody().strength(-560))
+  .force("link", d3.forceLink(LINKS).id(d => d.id).strength(0.45))
+  .force("charge", d3.forceManyBody())
   .force("collide", d3.forceCollide().radius(n => radius(n) + 18))
-  .force("x", d3.forceX().strength(0.06))
-  .force("y", d3.forceY().strength(0.06))
+  .force("x", d3.forceX().strength(0.05))
+  .force("y", d3.forceY().strength(0.05))
   .force("center", d3.forceCenter());
 
 const link = root.append("g")
@@ -310,6 +324,21 @@ sim.on("tick", () => {
   });
   node.attr("transform", d => `translate(${d.x},${d.y})`);
 });
+
+// ---- spacing slider ----
+function applySpread(s) {
+  sim.force("link").distance(BASE_LINK * s);
+  sim.force("charge").strength(BASE_CHARGE * s);
+  sim.alpha(0.6).restart();
+}
+const spreadInput = document.getElementById("spread");
+const spreadVal = d3.select("#spread-val");
+spreadInput.addEventListener("input", function () {
+  const s = +this.value;
+  spreadVal.html(s.toFixed(2) + "&times;");
+  applySpread(s);
+});
+applySpread(+spreadInput.value);
 
 // ---- legend + tier filtering ----
 const active = new Set(Object.keys(TIERS));
